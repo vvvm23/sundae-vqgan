@@ -1,0 +1,39 @@
+unroll_steps = 3
+
+[trainer]
+    exp_name = 'imagenet-hourglass-2162-4-large'
+    batch_size = 64
+    nb_batches = [128, 16]
+    learning_rate = 3e-5
+    metric_names = ['accuracy']
+    checkpoint_frequency = 10000
+    lr_scheduler_name = 'constant'
+
+[data]
+    train_root = 'data/imagenet-latents/train'
+    eval_root = 'data/imagenet-latents/val'
+    vocab_size = 1024
+    sequence_length = 256
+
+[vqgan]
+    config = 'config/vqgan/imagenet.yaml'
+    checkpoint = 'vqgan-ckpt/imagenet.ckpt'
+    latent_shape = [16, 16]
+
+[sampling]
+    steps = 200
+    nb_samples = 4
+    temperature = 0.8
+    end_temperature = 0.7
+    sample_proportion = 0.7
+    end_sample_proportion = 0.7
+
+[net]
+    type = 'hourglass'
+    dim = 2048
+    nb_heads = 12
+    shorten_factor = 4
+    depth = [2, 16, 2]
+    use_rotary = true
+    conditional = true
+    num_classes = 1000

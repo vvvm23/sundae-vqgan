@@ -1,0 +1,34 @@
+unroll_steps = 2
+
+[trainer]
+    exp_name = 'fashionmnist'
+    batch_size = 8
+    nb_batches = [256, 32]
+    learning_rate = 3e-5
+    metric_names = ['accuracy']
+    checkpoint_frequency = 5000
+    lr_scheduler_name = 'constant'
+
+[data]
+    train_root = 'data/discrete-fashionmnist/train'
+    eval_root = 'data/discrete-fashionmnist/eval'
+    vocab_size = 256
+    sequence_length = 784
+
+[sampling]
+    steps = 50
+    nb_samples = 4
+    temperature = 0.9
+    end_temperature = 0.9
+    sample_proportion = 1.0
+    end_sample_proportion = 1.0
+
+[net]
+    type = 'hourglass'
+    dim = 1024
+    nb_heads = 8
+    shorten_factor = 4
+    depth = [2, 8, 2]
+    use_rotary = true
+    conditional = true
+    num_classes = 10

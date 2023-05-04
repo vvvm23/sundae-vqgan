@@ -1,0 +1,38 @@
+unroll_steps = 3
+
+[trainer]
+    exp_name = 'ffhq1024-hourglass-2122-4'
+    batch_size = 10
+    nb_batches = [256, 32]
+    learning_rate = 5e-6
+    metric_names = ['accuracy']
+    checkpoint_frequency = 5000
+    lr_scheduler_name = 'constant'
+
+[data]
+    root = 'data/ffhq1024-latents'
+    vocab_size = 8192
+    sequence_length = 1024
+    split_sizes = [120000, 10000, 10000]
+
+[vqgan]
+    config = 'config/vqgan/ffhq1024.yaml'
+    checkpoint = 'vqgan-ckpt/ffhq1024-8192.ckpt'
+    latent_shape = [32, 32]
+
+[sampling]
+    steps = 50
+    nb_samples = 1
+    temperature = 1.0
+    end_temperature = 0.7
+    sample_proportion = 0.5
+    end_sample_proportion = 0.5
+
+[net]
+    type = 'hourglass'
+    dim = 1024
+    nb_heads = 8
+    shorten_factor = 4
+    depth = [2, 12, 2]
+    use_rotary = true
+    conditional = false

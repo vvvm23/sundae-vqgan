@@ -1,0 +1,38 @@
+unroll_steps = 3
+
+[trainer]
+    exp_name = 'celeba256-hourglass-2102-4'
+    batch_size = 48
+    nb_batches = [256, 32]
+    learning_rate = 3e-5
+    metric_names = ['accuracy']
+    checkpoint_frequency = 5000
+    lr_scheduler_name = 'constant'
+
+[data]
+    root = 'data/celeba256-latents'
+    vocab_size = 1024
+    sequence_length = 256
+    split_sizes = [380000, 20000, 5198]
+
+[vqgan]
+    config = 'config/vqgan/celeba256.yaml'
+    checkpoint = 'vqgan-ckpt/celeba256.ckpt'
+    latent_shape = [16, 16]
+
+[sampling]
+    steps = 200
+    nb_samples = 4
+    temperature = 0.8
+    end_temperature = 0.8
+    sample_proportion = 0.5
+    end_sample_proportion = 0.5
+
+[net]
+    type = 'hourglass'
+    dim = 1024
+    nb_heads = 8
+    shorten_factor = 4
+    depth = [2, 12, 2]
+    use_rotary = true
+    conditional = false

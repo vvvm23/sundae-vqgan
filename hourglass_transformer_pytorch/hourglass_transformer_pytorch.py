@@ -1,0 +1,663 @@
+import torch
+from torch import nn, einsum
+import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
+from einops import rearrange, reduce, repeat
+from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding, broadcat
+from performer_pytorch.performer_pytorch import Attention as PerformerAttention
+from math import sqrt
+from tqdm import tqdm
+
+# helpers
+
+
+def exists(val):
+    return val is not None
+
+
+def default(val, d):
+    return val if exists(val) else d
+
+
+def pad_to_multiple(tensor, multiple, dim=-1, value=0):
+    seq_len = tensor.shape[dim]
+    m = seq_len / multiple
+    if m.is_integer():
+        return tensor
+    remainder = math.ceil(m) * multiple - seq_len
+    pad_offset = (0,) * (-1 - dim) * 2
+    return F.pad(tensor, (*pad_offset, 0, remainder), value=value)
+
+
+def cast_tuple(val, depth=1):
+    return val if isinstance(val, tuple) else ((val,) * depth)
+
+
+# factory
+
+
+def get_hourglass_transformer(
+    dim, *, depth, shorten_factor, attn_resampling, updown_sample_type, **kwargs
+):
+    assert isinstance(depth, int) or (
+        isinstance(depth, tuple) and len(depth) == 3
+    ), "depth must be either an integer or a tuple of 3, indicating (pre_transformer_depth, <nested-hour-glass-config>, post_transformer_depth)"
+    assert not (
+        isinstance(depth, int) and shorten_factor
+    ), "there does not need to be a shortening factor when only a single transformer block is indicated (depth of one integer value)"
+
+    if isinstance(depth, int):
+        return Transformer(dim=dim, depth=depth, **kwargs)
+
+    return HourglassTransformer(
+        dim=dim,
+        depth=depth,
+        shorten_factor=shorten_factor,
+        attn_resampling=attn_resampling,
+        updown_sample_type=updown_sample_type,
+        **kwargs,
+    )
+
+
+# up and down sample classes
+
+
+class NaiveDownsample(nn.Module):
+    def __init__(self, shorten_factor, pixel=True):
+        super().__init__()
+        self.shorten_factor = int(sqrt(shorten_factor)) if pixel else shorten_factor
+        self.pixel = pixel
+
+    def forward(self, x):
+        if self.pixel:
+            x = rearrange(x, "b (h w) d -> b h w d", h=int(sqrt(x.shape[1])))
+            return reduce(
+                x,
+                "b (h sh) (w sw) d -> b (h w) d",
+                "mean",
+                sh=self.shorten_factor,
+                sw=self.shorten_factor,
+            )
+        return reduce(x, "b (n s) d -> b n d", "mean", s=self.shorten_factor)
+
+
+class NaiveUpsample(nn.Module):
+    def __init__(self, shorten_factor, pixel=True):
+        super().__init__()
+        self.shorten_factor = int(sqrt(shorten_factor)) if pixel else shorten_factor
+        self.pixel = pixel
+
+    def forward(self, x):
+        if self.pixel:
+            x = rearrange(x, "b (h w) d -> b h w d", h=int(sqrt(x.shape[1])))
+            x = repeat(
+                x,
+                "b h w d -> b (h sh) (w sw) d",
+                sh=self.shorten_factor,
+                sw=self.shorten_factor,
+            )
+            return rearrange(x, "b h w d -> b (h w) d")
+        return repeat(x, "b n d -> b (n s) d", s=self.shorten_factor)
+
+
+class LinearDownsample(nn.Module):
+    def __init__(self, dim, shorten_factor, pixel=True):
+        super().__init__()
+        self.proj = nn.Linear(dim * shorten_factor, dim)
+        self.shorten_factor = int(sqrt(shorten_factor)) if pixel else shorten_factor
+        self.pixel = pixel
+
+    def forward(self, x):
+        if self.pixel:
+            x = rearrange(x, "b (h w) d -> b h w d", h=int(sqrt(x.shape[1])))
+            x = rearrange(
+                x,
+                "b (h sh) (w sw) d -> b h w (d sh sw)",
+                sh=self.shorten_factor,
+                sw=self.shorten_factor,
+            )
+            x = self.proj(x)
+            return rearrange(x, "b h w d -> b (h w) d")
+
+        x = rearrange(x, "b (n s) d -> b n (s d)", s=self.shorten_factor)
+        return self.proj(x)
+
+
+class LinearUpsample(nn.Module):
+    def __init__(self, dim, shorten_factor, pixel=True):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim * shorten_factor)
+        self.shorten_factor = int(sqrt(shorten_factor)) if pixel else shorten_factor
+        self.pixel = pixel
+
+    def forward(self, x):
+        if self.pixel:
+            x = rearrange(x, "b (h w) d -> b h w d", h=int(sqrt(x.shape[1])))
+            x = self.proj(x)
+            x = rearrange(
+                x,
+                "b h w (d sh sw) -> b (h sh) (w sw) d",
+                sh=self.shorten_factor,
+                sw=self.shorten_factor,
+            )
+            return rearrange(x, "b h w d -> b (h w) d")
+        x = self.proj(x)
+        return rearrange(x, "b n (s d) -> b (n s) d", s=self.shorten_factor)
+
+
+# classes
+
+
+class PreNormResidual(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs) + x
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, causal=False):
+        super().__init__()
+        self.heads = heads
+        self.causal = causal
+        self.scale = dim_head**-0.5
+        inner_dim = heads * dim_head
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, context=None, mask=None, pos_emb=None):
+        h, device, has_context = self.heads, x.device, exists(context)
+        kv_input = default(context, x)
+
+        q, k, v = self.to_q(x), *self.to_kv(kv_input).chunk(2, dim=-1)
+        if exists(pos_emb) and not has_context:
+            q = rearrange(q, "b (h w) d -> b h w d", h=int(sqrt(q.shape[1])))
+            k = rearrange(k, "b (h w) d -> b h w d", h=int(sqrt(k.shape[1])))
+            q, k = apply_rotary_emb(pos_emb, q), apply_rotary_emb(pos_emb, k)
+            q = rearrange(q, "b h w d -> b (h w) d")
+            k = rearrange(k, "b h w d -> b (h w) d")
+
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+
+        q = q * self.scale
+
+        sim = einsum("b h i d, b h j d -> b h i j", q, k)
+        mask_value = -torch.finfo(sim.dtype).max
+
+        if exists(mask):
+            mask = rearrange(mask, "b j -> b () () j")
+            sim = sim.masked_fill(~mask, mask_value)
+
+        if self.causal:
+            i, j = sim.shape[-2:]
+            mask = torch.ones(i, j, device=device, dtype=torch.bool).triu_(j - i + 1)
+            mask = rearrange(mask, "i j -> () () i j")
+            sim = sim.masked_fill(mask, mask_value)
+
+        attn = sim.softmax(dim=-1)
+        attn = self.dropout(attn)
+
+        out = einsum("b h i j, b h j d -> b h i d", attn, v)
+        out = rearrange(out, "b h n d -> b n (h d)", h=h)
+        return self.to_out(out)
+
+
+def FeedForward(dim, mult=4, dropout=0.0):
+    return nn.Sequential(
+        nn.Linear(dim, dim * mult),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(dim * mult, dim),
+    )
+
+
+# transformer classes
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth,
+        causal=False,
+        heads=8,
+        dim_head=64,
+        attn_dropout=0.0,
+        ff_mult=4,
+        ff_dropout=0.0,
+        norm_out=False,
+        rotary_pos_emb=False,
+        rotary_emb_dim=None,
+        attn_type="vanilla",
+        max_seq_len=256,
+    ):
+        super().__init__()
+        assert attn_type in [
+            "vanilla",
+            "performer",
+        ], f"attention type '{attn_type}' not recognized!"
+        self.layers = nn.ModuleList([])
+
+        AttnModule = Attention if attn_type == "vanilla" else PerformerAttention
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        PreNormResidual(
+                            dim,
+                            AttnModule(
+                                dim,
+                                heads=heads,
+                                dim_head=dim_head,
+                                dropout=attn_dropout,
+                                causal=causal,
+                            ),
+                        ),
+                        PreNormResidual(
+                            dim, FeedForward(dim, mult=ff_mult, dropout=ff_dropout)
+                        ),
+                    ]
+                )
+            )
+
+        self.norm = nn.LayerNorm(dim) if norm_out else nn.Identity()
+
+        # if attn_type == 'vanilla':
+        # rotary_emb_dim = max(default(rotary_emb_dim, dim_head), 32)
+        # elif attn_type == 'performer':
+        # rotary_emb_dim = max(default(rotary_emb_dim, dim_head), 32)
+        rotary_emb_dim = default(rotary_emb_dim, dim_head // 2)
+
+        self.rotary_pos_emb = (
+            RotaryEmbedding(
+                rotary_emb_dim, freqs_for="pixel", max_freq=int(sqrt(max_seq_len))
+            )
+            if rotary_pos_emb
+            else None
+        )
+
+    def forward(self, x, context=None, mask=None):
+        rotary_pos_emb = None
+        if exists(self.rotary_pos_emb):
+            # rotary_pos_emb = self.rotary_pos_emb(torch.arange(x.shape[1]).to(x.device), cache_key = x.shape[1])
+            # rotary_pos_emb = self.rotary_pos_emb(torch.arange(x.shape[1]).to(x.device))
+            w = int(sqrt(x.shape[1]))
+            freqs_h = self.rotary_pos_emb(
+                torch.linspace(-1, 1, steps=w).to(x.device), cache_key=w
+            )
+            freqs_w = self.rotary_pos_emb(
+                torch.linspace(-1, 1, steps=w).to(x.device), cache_key=w
+            )
+            rotary_pos_emb = broadcat(
+                (freqs_h[:, None, :], freqs_w[None, :, :]), dim=-1
+            )
+
+        for attn, ff in self.layers:
+            x = attn(x, context=context, mask=mask, pos_emb=rotary_pos_emb)
+            x = ff(x)
+
+        return self.norm(x)
+
+
+class HourglassTransformer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth,
+        shorten_factor=2,
+        attn_resampling=True,
+        updown_sample_type="naive",
+        heads=8,
+        dim_head=64,
+        causal=False,
+        norm_out=False,
+        rotary_pos_emb=False,
+        rotary_emb_dim=None,
+        attn_type="vanilla",
+        max_seq_len=256,
+    ):
+        super().__init__()
+        assert len(depth) == 3, "depth should be a tuple of length 3"
+        assert updown_sample_type in {
+            "naive",
+            "linear",
+        }, "downsample / upsample type must be either naive (average pool and repeat) or linear (linear projection and reshape)"
+        assert attn_type in [
+            "vanilla",
+            "performer",
+        ], f"attention type '{attn_type}' not recognized!"
+
+        pre_layers_depth, valley_depth, post_layers_depth = depth
+
+        if isinstance(shorten_factor, (tuple, list)):
+            shorten_factor, *rest_shorten_factor = shorten_factor
+        elif isinstance(valley_depth, int):
+            shorten_factor, rest_shorten_factor = shorten_factor, None
+        else:
+            shorten_factor, rest_shorten_factor = shorten_factor, shorten_factor
+
+        transformer_kwargs = dict(
+            dim=dim,
+            heads=heads,
+            dim_head=dim_head,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_emb_dim=rotary_emb_dim,
+            attn_type=attn_type,
+        )
+
+        self.causal = causal
+        self.shorten_factor = shorten_factor
+
+        if updown_sample_type == "naive":
+            self.downsample = NaiveDownsample(shorten_factor)
+            self.upsample = NaiveUpsample(shorten_factor)
+        elif updown_sample_type == "linear":
+            self.downsample = LinearDownsample(dim, shorten_factor)
+            self.upsample = LinearUpsample(dim, shorten_factor)
+        else:
+            raise ValueError(
+                f"unknown updown_sample_type keyword value - must be either naive or linear for now"
+            )
+
+        self.valley_transformer = get_hourglass_transformer(
+            shorten_factor=rest_shorten_factor,
+            depth=valley_depth,
+            attn_resampling=attn_resampling,
+            updown_sample_type=updown_sample_type,
+            causal=causal,
+            max_seq_len=max_seq_len // shorten_factor,
+            **transformer_kwargs,
+        )
+
+        self.attn_resampling_pre_valley = (
+            Transformer(depth=1, **transformer_kwargs) if attn_resampling else None
+        )
+        self.attn_resampling_post_valley = (
+            Transformer(depth=1, **transformer_kwargs) if attn_resampling else None
+        )
+
+        self.pre_transformer = Transformer(
+            depth=pre_layers_depth, causal=causal, **transformer_kwargs
+        )
+        self.post_transformer = Transformer(
+            depth=post_layers_depth, causal=causal, **transformer_kwargs
+        )
+        self.norm_out = nn.LayerNorm(dim) if norm_out else nn.Identity()
+
+    def forward(self, x, mask=None):
+        # b : batch, n : sequence length, d : feature dimension, s : shortening factor
+
+        s, b, n = self.shorten_factor, *x.shape[:2]
+
+        # top half of hourglass, pre-transformer layers
+
+        x = self.pre_transformer(x, mask=mask)
+
+        # pad to multiple of shortening factor, in preparation for pooling
+
+        x = pad_to_multiple(x, s, dim=-2)
+
+        if exists(mask):
+            padded_mask = pad_to_multiple(mask, s, dim=-1, value=False)
+
+        # save the residual, and for "attention resampling" at downsample and upsample
+
+        x_residual = x.clone()
+
+        # if autoregressive, do the shift by shortening factor minus one
+
+        if self.causal:
+            shift = s - 1
+            x = F.pad(x, (0, 0, shift, -shift), value=0.0)
+
+            if exists(mask):
+                padded_mask = F.pad(padded_mask, (shift, -shift), value=False)
+
+        # naive average pool
+
+        downsampled = self.downsample(x)
+
+        if exists(mask):
+            downsampled_mask = reduce(padded_mask, "b (n s) -> b n", "sum", s=s) > 0
+        else:
+            downsampled_mask = None
+
+        # pre-valley "attention resampling" - they have the pooled token in each bucket attend to the tokens pre-pooled
+
+        if exists(self.attn_resampling_pre_valley):
+            if exists(mask):
+                attn_resampling_mask = rearrange(padded_mask, "b (n s) -> (b n) s", s=s)
+            else:
+                attn_resampling_mask = None
+
+            downsampled = self.attn_resampling_pre_valley(
+                rearrange(downsampled, "b n d -> (b n) () d"),
+                rearrange(x, "b (n s) d -> (b n) s d", s=s),
+                mask=attn_resampling_mask,
+            )
+
+            downsampled = rearrange(downsampled, "(b n) () d -> b n d", b=b)
+
+        # the "valley" - either a regular transformer or another hourglass
+
+        x = self.valley_transformer(downsampled, mask=downsampled_mask)
+
+        valley_out = x.clone()
+
+        # naive repeat upsample
+
+        x = self.upsample(x)
+
+        # add the residual
+
+        x = x + x_residual
+
+        # post-valley "attention resampling"
+
+        if exists(self.attn_resampling_post_valley):
+            x = self.attn_resampling_post_valley(
+                rearrange(x, "b (n s) d -> (b n) s d", s=s),
+                rearrange(valley_out, "b n d -> (b n) () d"),
+            )
+
+            x = rearrange(x, "(b n) s d -> b (n s) d", b=b)
+
+        # bring sequence back to original length, if it were padded for pooling
+
+        x = x[:, :n]
+
+        # post-valley transformers
+
+        x = self.post_transformer(x, mask=mask)
+        return self.norm_out(x)
+
+
+# main class
+
+
+class HourglassTransformerLM(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_tokens,
+        dim,
+        max_seq_len,
+        depth,
+        shorten_factor=None,
+        heads=8,
+        dim_head=64,
+        attn_resampling=True,
+        updown_sample_type="naive",
+        causal=True,
+        rotary_pos_emb=False,
+        rotary_emb_dim=None,
+        attn_type="vanilla",
+        conditional=False,
+        num_classes=None,
+    ):
+        super().__init__()
+        assert attn_type in [
+            "vanilla",
+            "performer",
+        ], f"attention type '{attn_type}' not recognized!"
+        self.max_seq_len = max_seq_len
+        self.num_tokens = num_tokens
+        self.conditional = conditional
+
+        if self.conditional:
+            self.class_emb = nn.Embedding(num_classes, dim)
+
+        self.token_emb = nn.Embedding(num_tokens, dim)
+        self.pos_emb = None if rotary_pos_emb else nn.Embedding(max_seq_len, dim)
+
+        self.transformer = get_hourglass_transformer(
+            dim=dim,
+            depth=depth,
+            shorten_factor=shorten_factor,
+            attn_resampling=attn_resampling,
+            updown_sample_type=updown_sample_type,
+            dim_head=dim_head,
+            heads=heads,
+            causal=causal,
+            norm_out=True,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_emb_dim=rotary_emb_dim,
+            attn_type=attn_type,
+            max_seq_len=max_seq_len,
+        )
+
+        self.to_logits = nn.Linear(dim, num_tokens)
+
+    def forward(self, x, mask=None, c=None):
+        assert exists(c) == self.conditional
+        device = x.device
+
+        x = self.token_emb(x)
+        if self.conditional:
+            c_emb = self.class_emb(c)
+            c_emb = repeat(c_emb, "n d -> n l d", l=x.shape[1])
+            x = x + c_emb
+
+        if exists(self.pos_emb):
+            pos_emb = self.pos_emb(torch.arange(x.shape[1], device=device))
+            x = x + rearrange(pos_emb, "n d -> () n d")
+
+        x = self.transformer(x, mask=mask)
+        return self.to_logits(x)
+
+    @torch.inference_mode()
+    @torch.cuda.amp.autocast()
+    def sample(
+        self,
+        steps,
+        nb_samples,
+        temperature,
+        sample_proportion,
+        device,
+        start_latent=None,
+        inpaint_mask=None,
+        end_temperature=None,
+        end_sample_proportion=None,
+        status=False,
+        history=False,
+        min_steps=10,
+        early_stop=True,
+        c=None,
+        **kwargs,
+    ):
+        sample_history = [] if history else None
+
+        if exists(start_latent):
+            batched_text = start_latent.clone().to(device)
+        else:
+            batched_text = torch.randint(
+                self.num_tokens, (nb_samples, self.max_seq_len)
+            ).to(device)
+        sample_mask = torch.zeros(nb_samples).bool().to(device)
+        end_temperature = default(end_temperature, temperature)
+        end_sample_proportion = default(end_sample_proportion, sample_proportion)
+        min_steps = min_steps if early_stop else steps
+
+        temperatures = torch.linspace(temperature, end_temperature, steps)
+        proportions = torch.linspace(sample_proportion, end_sample_proportion, steps)
+        pb = tqdm(total=steps, disable=not status)
+        for n, (temperature, sample_proportion) in enumerate(
+            zip(temperatures, proportions)
+        ):
+            old_sample_mask = sample_mask.clone()
+            logits = self.forward(
+                batched_text[~sample_mask], c=None if c == None else c[~sample_mask]
+            )
+            sample = Categorical(logits=logits / temperature).sample()
+
+            mask = (torch.rand(sample.shape) > sample_proportion).to(
+                batched_text.device
+            )
+            if exists(inpaint_mask):
+                mask = mask.logical_or(inpaint_mask)
+            sample[mask] = batched_text[~sample_mask][mask]
+            if n >= min_steps:
+                sample_mask[~sample_mask] = torch.all(
+                    (sample == batched_text[~sample_mask]).view(sample.shape[0], -1),
+                    dim=-1,
+                )
+
+            if torch.all(sample_mask).item():
+                break
+            batched_text[~old_sample_mask] = sample
+
+            if history:
+                sample_history.append(batched_text.cpu().clone())
+
+            pb.set_description_str(
+                f"T: {temperature:.3f}, p: {sample_proportion:.3f}, [{sample_mask.long().sum().item()} / {batched_text.shape[0]}]"
+            )
+            pb.update(1)
+
+        if history:
+            return batched_text, sample_history
+
+        return batched_text
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda")
+    net = HourglassTransformerLM(
+        num_tokens=2000,
+        dim=768,
+        dim_head=64,
+        max_seq_len=256,
+        depth=(2, 10, 2),
+        shorten_factor=4,
+        causal=False,
+        rotary_pos_emb=True,
+        attn_type="vanilla",
+        updown_sample_type="linear",
+    ).to(device)
+    print("num parameters:", sum(p.numel() for p in net.parameters()))
+    with torch.cuda.amp.autocast():
+        x = torch.randint(0, 2000, (1, 256)).to(device)
+        y = net(x)
+
+    print(
+        net.sample(
+            10,
+            16,
+            1.0,
+            0.5,
+            device,
+            end_temperature=0.7,
+            end_sample_proportion=1.0,
+            status=True,
+        ).shape
+    )
+    print("memory usage:", torch.cuda.max_memory_allocated())

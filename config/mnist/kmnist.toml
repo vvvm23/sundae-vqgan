@@ -1,0 +1,34 @@
+unroll_steps = 3
+
+[trainer]
+    exp_name = 'kmnist'
+    batch_size = 10
+    nb_batches = [256, 32]
+    learning_rate = 3e-5
+    metric_names = ['accuracy']
+    checkpoint_frequency = 20000
+    lr_scheduler_name = 'constant'
+
+[data]
+    train_root = 'data/discrete-kmnist/train'
+    eval_root = 'data/discrete-kmnist/eval'
+    vocab_size = 256
+    sequence_length = 784
+
+[sampling]
+    steps = 100
+    nb_samples = 4
+    temperature = 0.8
+    end_temperature = 0.8
+    sample_proportion = 1.0
+    end_sample_proportion = 1.0
+
+[net]
+    type = 'hourglass'
+    dim = 1024
+    nb_heads = 8
+    shorten_factor = 4
+    depth = [2, 10, 2]
+    use_rotary = true
+    conditional = true
+    num_classes = 10
