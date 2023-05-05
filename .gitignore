@@ -141,3 +141,5 @@ taming/
 
 fid-samples-*
 *.png
+
+!imgs/overall.png

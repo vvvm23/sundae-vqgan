@@ -1,7 +1,25 @@
 # Megapixel Image Generation with Step-unrolled Denoising Autoencoders
 
+[Paper](https://arxiv.org/abs/2206.12351) | [Twitter Summary](https://twitter.com/alexfmckinney/status/1541350462460493828)
+
 Code for my master's dissertation into fast sampling of VQ-GAN latents using
 step-unrolled denoising autoencoders (SUNDAE).
+
+![Banner image of FFHQ1024 samples](imgs/banner.jpg)
+> Representative FFHQ1024 outputs, sampled in only 2 seconds on a GTX 1080Ti
+
+The paper combines non-autoregressive text model SUNDAE with a powerful
+pretrained VQ-GAN and efficient transformer backbone (Hourglass Transformers)
+to produce a fast image generation framework. This framework was successfully
+scaled to 1024x1024 images and can produce diverse and realistic samples in
+approximately 2 seconds on a GTX 1080Ti. Furthermore, it was the first work to
+demonstrate both scaling of SUNDAE to long sequence lengths and VQ-GAN to
+megapixel images. Perceptual quality metrics such as FID were not state of the
+art, but I hope the method and code is useful to the community, as well
+encouraging further exploration of non-autoregressive discrete models.
+
+![Overview of SUNDAE-VQGAN Training and Sampling](imgs/overall.png)
+> Overview of SUNDAE-VQGAN Training and Sampling
 
 This repository contains:
 - `generate-latents.py`: latent dataset generation script using trained VQ-GAN.
@@ -41,7 +59,11 @@ Download pretrained VQ-GAN checkpoints and place them in a directory named
 [taming-transformers](https://github.com/CompVis/taming-transformers) is suitable.
 
 > If the checkpoint is a combined VQ-GAN + GPT prior, add ``--legacy-cfg`` as
-> an additional argument to scripts that use VQ-GAN.
+> an additional argument to scripts that use VQ-GAN. To be explicit, if the
+> config you downloaded contains keywords such as `transformer_config` or
+> `first_stage_config` you should use this flag.
+
+`TODO: add support for latent diffusion style VQ-GAN`
 
 ## Usage
 
@@ -99,7 +121,11 @@ are structured as follows:
 ## Pretrained Checkpoints
 `TODO: track these down`
 
+---
+
 ### Reference
+
+This work takes strong inspiration from the following papers:
 
 **Step-unrolled Denoising Autoencoders for Text Generation**
 > Nikolay Savinov, Junyoung Chung, Mikolaj Binkowski, Erich Elsen, Aaron van den Oord
