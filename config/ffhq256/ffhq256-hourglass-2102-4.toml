@@ -2,7 +2,7 @@ unroll_steps = 2
 
 [trainer]
     exp_name = 'ffhq256-hourglass-2102-4'
-    batch_size = 48
+    batch_size = 64
     nb_batches = [512, 64]
     learning_rate = 3e-5
     metric_names = ['accuracy']
@@ -17,7 +17,7 @@ unroll_steps = 2
 
 [vqgan]
     config = 'config/vqgan/ffhq256.yaml'
-    checkpoint = 'ffhq256-vqgan.ckpt'
+    checkpoint = 'vqgan-ckpt/ffhq256.ckpt'
     latent_shape = [16, 16]
 
 [sampling]

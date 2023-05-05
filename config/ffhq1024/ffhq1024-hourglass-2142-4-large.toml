@@ -21,10 +21,12 @@ unroll_steps = 2
     latent_shape = [32, 32]
 
 [sampling]
-    steps = 1000
+    steps = 100
     nb_samples = 4
     temperature = 0.7
+    end_temperature = 0.7
     sample_proportion = 0.5
+    end_sample_proportion = 0.5
 
 [net]
     type = 'hourglass'
@@ -33,3 +35,4 @@ unroll_steps = 2
     shorten_factor = 4
     depth = [2, 14, 2]
     use_rotary = true
+    conditional = false
