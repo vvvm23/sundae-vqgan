@@ -16,8 +16,8 @@ unroll_steps = 2
     split_sizes = [120000, 10000, 10000]
 
 [vqgan]
-    config = 'ffhq.yaml'
-    checkpoint = 'ffhq.ckpt'
+    config = 'config/vqgan/ffhq256.yaml'
+    checkpoint = 'ffhq256-vqgan.ckpt'
     latent_shape = [16, 16]
 
 [sampling]
@@ -33,3 +33,4 @@ unroll_steps = 2
     shorten_factor = 2
     depth = [2, 10, 2]
     use_rotary = true
+    conditional = false
